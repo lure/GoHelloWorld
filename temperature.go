@@ -13,8 +13,8 @@ import (
 func main() {
 
 	awp := allWeatherProvider{
-		openWeatherMap{apiKey: ""},
 		apixuMap{apiKey: ""},
+		openWeatherMap{apiKey: ""},
 	}
 
 	http.HandleFunc("/", hello)
@@ -34,11 +34,11 @@ func main() {
 		})
 	})
 
-	http.ListenAndServe("127.0.0.1:8080", nil)
+	_ = http.ListenAndServe("127.0.0.1:8080", nil)
 }
 
-func hello(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("hello, this is weather api"))
+func hello(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte("hello, this is weather api"))
 }
 
 type weatherProvider interface {
@@ -47,17 +47,43 @@ type weatherProvider interface {
 type allWeatherProvider []weatherProvider
 
 func (w allWeatherProvider) temperature(city string, providers ...weatherProvider) (float64, error) {
-	sum := 0.0
-	for _, provider := range w {
-		k, err := provider.temperature(city)
-		if err != nil {
-			return 0, err
+	pLen := len(w)
+	if pLen > 0 {
+		temps := make(chan float64, pLen)
+		errs := make(chan error, pLen)
+
+		// creating go-routine and immediately apply it to current argument
+		for _, provider := range w {
+			go func(p weatherProvider) {
+				k, err := p.temperature(city)
+				if err != nil {
+					errs <- err
+					return
+				}
+				temps <- k
+			}(provider)
 		}
-		sum += k
+
+		sum := 0.0
+		// select available messages, similar to non-blocking IO
+		for i := 0; i < pLen; i++ {
+			select {
+			case temp := <-temps:
+				sum += temp
+			case err := <-errs:
+				return 0, err
+			case <-time.After(10 * time.Second):
+				return 0, errors.New("timed out")
+			}
+		}
+
+		result := sum / float64(pLen)
+		log.Printf("medium temperature: %s: %.2f", city, result)
+		return result, nil
+	} else {
+		log.Printf("No providers available: %s: 0", city)
+		return 0, errors.New("no providers available")
 	}
-	result := sum / float64(len(w))
-	log.Printf("medium temperature: %s: %.2f", city, result)
-	return result, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -71,7 +97,7 @@ func (w openWeatherMap) temperature(city string) (float64, error) {
 		return 0, err
 	}
 
-	defer resp.Body.Close()
+	defer closeFunc(resp, "openWeatherMap")
 
 	if resp.StatusCode != http.StatusOK {
 		var msg struct {
@@ -109,14 +135,14 @@ func (w apixuMap) temperature(city string) (float64, error) {
 		return 0, err
 	}
 
-	defer resp.Body.Close()
+	defer closeFunc(resp, "apixuMap")
 
 	if resp.StatusCode != http.StatusOK {
 		var msg struct {
 			Error struct {
 				Msg  string `json:"message"`
 				Code int    `json:"code"`
-			} `json:"error`
+			} `json:"error"`
 		}
 		json.NewDecoder(resp.Body).Decode(&msg)
 		return 0, errors.New(strconv.Itoa(msg.Error.Code) + ":" + msg.Error.Msg)
@@ -135,4 +161,10 @@ func (w apixuMap) temperature(city string) (float64, error) {
 	kelvin := d.Current.Celsius + 273.15
 	log.Printf("apixu: %s: %.2f", city, kelvin)
 	return kelvin, nil
+}
+
+func closeFunc(resp *http.Response, name string) {
+	if err := resp.Body.Close(); err != nil {
+		log.Printf(name + "failed to defer body close:" + err.Error())
+	}
 }
